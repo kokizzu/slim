@@ -5,8 +5,8 @@ import (
 	"testing"
 
 	proto "github.com/golang/protobuf/proto"
+	"github.com/openacid/low/size"
 	"github.com/openacid/slim/benchhelper"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -40,7 +40,7 @@ var polyTestNums []int32 = []int32{
 
 func TestMarginWidth(t *testing.T) {
 
-	ta := assert.New(t)
+	ta := require.New(t)
 
 	cases := []struct {
 		input int32
@@ -72,7 +72,7 @@ func TestMarginWidth(t *testing.T) {
 }
 
 func TestDense_New(t *testing.T) {
-	ta := assert.New(t)
+	ta := require.New(t)
 
 	cases := [][]int32{
 		{},
@@ -97,6 +97,7 @@ func TestDense_New(t *testing.T) {
 
 		// Stat() should work
 		_ = a.Stat()
+		fmt.Println(a.Stat())
 	}
 }
 
@@ -110,10 +111,7 @@ func TestNewDense_eltWidthSmall(t *testing.T) {
 		nums[i] = int32(15 * i)
 	}
 
-	a := NewPolyArray(nums[:2])
-	ta.Equal(uint32(0), a.Segments[0].Info[0])
-
-	a = NewPolyArray(nums)
+	a := NewPolyArray(nums)
 	fmt.Println(a.Stat())
 	ta.True(a.Stat()["bits/elt"] <= 4)
 
@@ -121,20 +119,22 @@ func TestNewDense_eltWidthSmall(t *testing.T) {
 
 func TestNewDense_default(t *testing.T) {
 
-	ta := assert.New(t)
+	ta := require.New(t)
 
 	a := NewPolyArray(polyTestNums)
 	ta.Equal(int32(len(polyTestNums)), a.N)
 
 	fmt.Println(a.Stat())
 	st := a.Stat()
+
+	fmt.Println(size.Stat(a, 6, 3))
 	ta.Equal(int32(3), st["elt_width"])
 
 }
 
 func TestNewDense_big(t *testing.T) {
 
-	ta := assert.New(t)
+	ta := require.New(t)
 
 	n := int32(1024 * 1024)
 	step := int32(64)
@@ -150,7 +150,7 @@ func TestNewDense_big(t *testing.T) {
 
 func TestNewDense_largenum(t *testing.T) {
 
-	ta := assert.New(t)
+	ta := require.New(t)
 
 	n := int32(1024 * 1024)
 	step := int32(64)
@@ -171,11 +171,11 @@ func TestNewDense_largenum(t *testing.T) {
 }
 
 func TestDense_Get_panic(t *testing.T) {
-	ta := assert.New(t)
+	ta := require.New(t)
 
 	a := NewPolyArray(polyTestNums)
 	ta.Panics(func() {
-		a.Get(int32(len(polyTestNums)))
+		a.Get(int32(len(polyTestNums) + 64))
 	})
 	ta.Panics(func() {
 		a.Get(int32(-1))
@@ -192,17 +192,17 @@ func TestDense_Stat(t *testing.T) {
 	want := map[string]int32{
 		"seg_cnt":   1,
 		"elt_width": 3,
-		"mem_elts":  248,
+		"mem_elts":  160,
 		"mem_total": st["mem_total"], // do not compare this
-		"polys/seg": 3,
-		"bits/elt":  11,
+		"polys/seg": 4,
+		"bits/elt":  10,
 	}
 
 	ta.Equal(want, st)
 }
 
 func TestDense_marshalUnmarshal(t *testing.T) {
-	ta := assert.New(t)
+	ta := require.New(t)
 
 	a := NewPolyArray(polyTestNums)
 

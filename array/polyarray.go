@@ -5,34 +5,44 @@ import (
 	"math"
 	"math/bits"
 
+	"github.com/openacid/low/bitmap"
 	"github.com/openacid/low/size"
 	"github.com/openacid/slim/polyfit"
 )
 
 const (
-	maxEltWidth    = 16
-	maxBitIndex    = 1 << 16
-	maxSegmentSize = maxBitIndex / maxEltWidth
+	maxResidualWidth = 16
+	minSpanSize      = int32(16)
 
-	// allows max eltWidth=64 thus "start" is under 2^16
 	segmentSize = 1024
 	segWidth    = uint(10)
 	segMask     = int32(1024 - 1)
+
+	polyDegree      = 2
+	polyCoefCnt     = polyDegree + 1
+	f64PerSpan      = polyCoefCnt + 1 // 3 coefficients and 1 config
+	f64PerSpanShift = 2               // 3 coefficients and 1 config
+	twoPow36        = float64(int64(1) << 36)
+
+	// In a segment we want:
+	//	residual position = offset + (i%1024) * residualWidth
+	// But if preceding span has smaller residual width, the "offset" could be
+	// negative, e.g.: span[0] has residual of width 0 and 16 residuals,
+	// span[1] has residual of width 4.
+	// Then the "offset" of span[1] is -16*4 in order to satisify:
+	// (-16*4) + i * 4 is the correct residual position, for i in [16, 32).
+	maxNegOffset = int64(segWidth) * int64(maxResidualWidth)
 )
 
-const polyDegree = 2
-const polyCoefCnt = polyDegree + 1
-
-// evalpoly is a quick path of eval.
+// evalpoly2 evaluates a polynomial with degree=2.
 //
 // Since 0.5.2
-func evalpoly(poly []float64, x float64) float64 {
-	// return poly[0] + poly[1]*x + poly[2]*x*x + poly[3]*x*x*x
+func evalpoly2(poly []float64, x float64) float64 {
 	return poly[0] + poly[1]*x + poly[2]*x*x
 }
 
 // NewPolyArray creates a "PolyArray" array from a slice of int32.
-// A "PolyArray" array uses several polynomial curves to compress data.
+// A "PolyArray" array uses polynomial curves to compress data.
 //
 // It is very efficient to store a serias integers with a overall trend, such as
 // a sorted array.
@@ -44,66 +54,56 @@ func NewPolyArray(nums []int32) *PolyArray {
 		N: int32(len(nums)),
 	}
 
-	for {
-		if len(nums) > segmentSize {
-			pa.addSeg(nums[:segmentSize])
-			nums = nums[segmentSize:]
-		} else {
-			pa.addSeg(nums)
-			break
-		}
+	for ; len(nums) > segmentSize; nums = nums[segmentSize:] {
+		pa.addSeg(nums[:segmentSize])
+	}
+	if len(nums) > 0 {
+		pa.addSeg(nums)
 	}
 
-	segs := make([]*Segment, len(pa.Segments))
-	copy(segs, pa.Segments)
-	pa.Segments = segs
+	// Add another empty word to avoid panic for residual of width = 0.
+	pa.Residuals = append(pa.Residuals, 0)
+	pa.Residuals = append(pa.Residuals[:0:0], pa.Residuals...)
 
 	return pa
 }
 
 // Get returns the uncompressed int32 value.
-//
-// A Get() costs about 15 ns
+// A Get() costs about 11 ns
 //
 // Since 0.5.2
 func (m *PolyArray) Get(i int32) int32 {
 
-	if i >= m.N {
-		panic(fmt.Sprintf("i=%d out of boundary N=%d", i, m.N))
-	}
+	bitmapI := (i >> segWidth) << 1
+	polyBitmap, rank := m.Bitmap[bitmapI], m.Bitmap[bitmapI|1]
 
-	iSeg := i >> segWidth
 	i = i & segMask
 	x := float64(i)
 
-	seg := m.Segments[iSeg]
+	bm := polyBitmap & bitmap.RightMasks[i>>4]
+	polyI := int(rank) + bits.OnesCount64(bm)
 
-	iPoly := i >> seg.PolySpanWidth
-	i = i & (seg.PolySpan - 1)
+	// evalpoly2(poly, x)
 
-	j := iPoly * polyCoefCnt
-	p := seg.Polynomials
-
-	// evalpoly(r, x)
+	j := polyI << f64PerSpanShift
+	p := m.Polynomials
 	v := int32(p[j] + p[j+1]*x + p[j+2]*x*x)
 
-	// start, eltWidth := unpackInfo(seg.Info[iPoly])
-	info := seg.Info[iPoly]
-	start, eltWidth := uint16(info>>8), uint8(info)
+	// read the config of this polynomial:
+	// residualWidth: how many bits a residual needs.
+	// offset.
 
-	if eltWidth == 0 {
-		return v
-	}
+	config := p[j+3]
+	residualWidth := int64(config)
+	offset := int64((config-float64(residualWidth))*twoPow36) - maxNegOffset
 
-	eltMask := (1 << eltWidth) - 1
+	// where the residual is
+	ibit := offset + int64(i)*residualWidth
 
-	ibit := int32(start) + i*int32(eltWidth)
+	d := m.Residuals[ibit>>6]
+	d = d >> uint(ibit&63)
 
-	d := seg.Words[ibit>>6]
-
-	d = d >> (uint(ibit & 63))
-
-	return v + int32(d&int64(eltMask))
+	return v + int32(d&bitmap.RightMasks[residualWidth])
 }
 
 // Len returns number of elements.
@@ -124,22 +124,16 @@ func (m *PolyArray) Len() int {
 //
 // Since 0.5.2
 func (m *PolyArray) Stat() map[string]int32 {
-	nseg := len(m.Segments)
+	nseg := len(m.Bitmap) / 2
 	totalmem := size.Of(m)
 
-	polyCnt := 0
-	memWords := 0
+	polyCnt := len(m.Polynomials) >> 2
+	memWords := len(m.Residuals) * 8
 	widthAvg := 0
-	for _, seg := range m.Segments {
-		polyCnt += len(seg.Polynomials)
-		memWords += size.Of(seg.Words)
-
-		width := 0
-		for _, inf := range seg.Info {
-			_, w := unpackInfo(inf)
-			width += int(w)
-		}
-		widthAvg += width / len(seg.Info)
+	for i := 0; i < polyCnt; i++ {
+		// get the last float64
+		_, w := unpackConfig(m.Polynomials[i*f64PerSpan+f64PerSpan-1])
+		widthAvg += int(w)
 	}
 
 	n := m.Len()
@@ -147,27 +141,50 @@ func (m *PolyArray) Stat() map[string]int32 {
 		n = 1
 	}
 
+	if polyCnt == 0 {
+		polyCnt = 1
+	}
+
 	st := map[string]int32{
 		"seg_cnt":   int32(nseg),
-		"elt_width": int32(widthAvg / nseg),
+		"elt_width": int32(widthAvg / polyCnt),
 		"mem_total": int32(totalmem),
 		"mem_elts":  int32(memWords),
 		"bits/elt":  int32(totalmem * 8 / n),
-		"polys/seg": int32(polyCnt / nseg / polyCoefCnt),
+		"polys/seg": int32((polyCnt * 1000) / (nseg*1000 + 1)),
 	}
 
 	return st
 }
 
-func packInfo(start uint16, width uint8) uint32 {
-	return (uint32(start) << 8) + (uint32(width))
+func packConfig(offset int64, residualWidth int64) float64 {
+	return float64(residualWidth) + float64(offset)/twoPow36
 }
 
-func unpackInfo(info uint32) (uint16, uint8) {
-	return uint16(info >> 8), uint8(info)
+func unpackConfig(config float64) (int64, int64) {
+	residualWidth := int64(config)
+	offset := int64((config - float64(residualWidth)) * twoPow36)
+	return offset, residualWidth
 }
 
 func (m *PolyArray) addSeg(nums []int32) {
+
+	bm, polys, words := newSeg(nums, int64(len(m.Residuals)*64))
+
+	var r uint64
+	if len(m.Bitmap) > 0 {
+		l := len(m.Bitmap)
+		r = m.Bitmap[l-1] + uint64(bits.OnesCount64(m.Bitmap[l-2]))
+	} else {
+		r = 0
+	}
+
+	m.Bitmap = append(m.Bitmap, bm, r)
+	m.Polynomials = append(m.Polynomials, polys...)
+	m.Residuals = append(m.Residuals, words...)
+}
+
+func newSeg(nums []int32, start int64) (uint64, []float64, []uint64) {
 
 	n := int32(len(nums))
 	xs := make([]float64, n)
@@ -178,74 +195,63 @@ func (m *PolyArray) addSeg(nums []int32) {
 		ys[i] = float64(v)
 	}
 
-	// min polyspan
-	polyspan := int32(16)
-	fts := initFittings(xs, ys, polyspan)
+	// create polynomial fit sessions for every 16 numbers
+	fts := initFittings(xs, ys, minSpanSize)
 
-	polyspan, polys, widths, fts := findMinFittings(xs, ys, fts, polyspan)
+	spans := findMinFittingsNew(xs, ys, fts)
 
-	infos := make([]uint32, 0)
-	words := make([]int64, n) // max size
+	polys := make([]float64, 0)
+	words := make([]uint64, n) // max size
 
-	// where the first elt of a polynomial in words
-	start := int32(0)
+	// Using a bitmap to describe which spans a polynomial spans
+	segPolyBitmap := uint64(0)
 
-	var s, e int32
-	for i := int32(0); i < int32(len(fts)); i++ {
-		s = e
-		e += int32(fts[i].N)
+	resI := int64(0)
 
-		poly := polys[i*polyCoefCnt : i*polyCoefCnt+polyCoefCnt]
-		eltWidth := widths[i]
-		margin := int32((1 << eltWidth) - 1)
-		if eltWidth > 0 {
-			start = (start + int32(eltWidth) - 1)
-			start -= start % int32(eltWidth)
+	for _, sp := range spans {
+
+		// every poly starts at 16*k th point
+		segPolyBitmap |= (1 << uint((sp.e-1)>>4))
+
+		width := sp.residualWidth
+		margin := int32((1 << width) - 1)
+		if width > 0 {
+			resI = (resI + int64(width) - 1)
+			resI -= resI % int64(width)
 		}
 
-		if start >= 65536 {
-			panic(fmt.Sprintf("wordStart is too large:%d", start))
+		if resI+start >= int64(1)<<35 {
+			panic(fmt.Sprintf("wordStart is too large:%d, should < 2^35", resI+start))
 		}
 
-		infos = append(infos, packInfo(uint16(start), uint8(eltWidth)))
+		polys = append(polys, sp.poly...)
 
-		for j := s; j < e; j++ {
+		// We want eltIndex = stBySeg + i * residualWidth
+		// min of stBySeg is -segWidth * residualWidth = -1024 * 16;
+		// Add this value to make it a positive number.
+		offset := resI + start - int64(sp.s)*int64(width)
+		config := packConfig(offset+maxNegOffset, int64(width))
+		polys = append(polys, config)
 
-			v := evalpoly(poly, xs[j])
+		for j := sp.s; j < sp.e; j++ {
 
-			d := int64(nums[j]) - int64(v)
-			if d > int64(margin) || d < 0 {
+			v := evalpoly2(sp.poly, xs[j])
+
+			d := nums[j] - int32(v)
+			if d > margin || d < 0 {
 				panic(fmt.Sprintf("d=%d must smaller than %d and > 0", d, margin))
 			}
-			iWord := start >> 6
-			words[iWord] |= d << uint(start&63)
-			start += int32(eltWidth)
+
+			wordI := resI >> 6
+			words[wordI] |= uint64(d) << uint(resI&63)
+
+			resI += int64(width)
 		}
 	}
 
-	// last start is for len(nums)
-	infos = append(infos, packInfo(uint16(start), uint8(0)))
+	nWords := (resI + 63) >> 6
 
-	nWords := (start + 63) >> 6
-
-	seg := &Segment{}
-	seg.PolySpan = polyspan
-	seg.PolySpanWidth = log2u64(uint64(polyspan))
-
-	seg.Polynomials = append(polys[:0:0], polys...)
-	seg.Words = append(words[:0:0], words[:nWords]...)
-	seg.Info = append(infos[:0:0], infos...)
-
-	m.Segments = append(m.Segments, seg)
-}
-
-func log2u64(i uint64) uint32 {
-
-	if i == 0 {
-		return 0
-	}
-
-	return uint32(63 - bits.LeadingZeros64(i))
+	return segPolyBitmap, polys, words[:nWords]
 }
 
 func initFittings(xs, ys []float64, polysize int32) []*polyfit.Fitting {
@@ -260,78 +266,125 @@ func initFittings(xs, ys []float64, polysize int32) []*polyfit.Fitting {
 			e = n
 		}
 
-		xx := xs[s:e]
-		yy := ys[s:e]
-		ft := polyfit.NewFitting(xx, yy, polyDegree)
+		ft := polyfit.NewFitting(xs[s:e], ys[s:e], polyDegree)
 		fts = append(fts, ft)
 	}
 	return fts
 }
 
-func findMinFittings(xs, ys []float64, fts []*polyfit.Fitting, polysize int32) (int32, []float64, []uint32, []*polyfit.Fitting) {
-	minMem := 1 << 30
-
-	minPolys := make([]float64, 0)
-	minWidths := make([]uint32, 0)
-	minFts := []*polyfit.Fitting(nil)
-	minPolySize := polysize
-	for {
-		polys := make([]float64, 0)
-		widths := make([]uint32, 0)
-
-		mem := 0
-
-		var s, e int32
-		for _, ft := range fts {
-			s = e
-			e += int32(ft.N)
-
-			poly := ft.Solve(true)
-			max, min := maxminResiduals(poly, xs[s:e], ys[s:e])
-			margin := int32(math.Ceil(max - min))
-			poly[0] += min
-
-			eltWidth := marginWidth(margin)
-			mem += memCost(poly, eltWidth, int32(ft.N))
-
-			polys = append(polys, poly...)
-			widths = append(widths, eltWidth)
-		}
-
-		if minMem > mem {
-			minMem = mem
-			minPolys = append(polys[:0:0], polys...)
-			minWidths = append(widths[:0:0], widths...)
-			minFts = fts
-			minPolySize = polysize
-
-			fts = mergeFittings(fts)
-			polysize *= 2
-
-		} else {
-			return minPolySize, minPolys, minWidths, minFts
-		}
-	}
-
+type span struct {
+	ft            *polyfit.Fitting
+	poly          []float64
+	residualWidth uint32
+	mem           int
+	s, e          int32
 }
 
-func mergeFittings(fts []*polyfit.Fitting) []*polyfit.Fitting {
+func (sp span) String() string {
+	return fmt.Sprintf("%d-%d(%d): width: %d, mem: %d, poly: %v",
+		sp.s, sp.e, sp.e-sp.s, sp.residualWidth, sp.mem, sp.poly)
+}
 
-	newFts := make([]*polyfit.Fitting, 0)
-	for i := 0; i < len(fts)/2; i++ {
-		f := polyfit.NewFitting(nil, nil, fts[i*2].Degree)
-		f.Merge(fts[i*2])
-		f.Merge(fts[i*2+1])
-		newFts = append(newFts, f)
-	}
-	if len(fts)%2 == 1 {
-		i := len(fts) - 1
-		f := polyfit.NewFitting(nil, nil, fts[i].Degree)
-		f.Merge(fts[i])
-		newFts = append(newFts, f)
+// findMinFittingsNew by merge adjacent 16-numbers span.
+// If two spans has a common trend they should be described with one polynomial.
+func findMinFittingsNew(xs, ys []float64, fts []*polyfit.Fitting) []span {
+
+	if len(fts) == 0 {
+		return []span{}
 	}
 
-	return newFts
+	spans := make([]span, len(fts))
+	merged := make([]span, len(fts)-1)
+
+	var s, e int32
+	s = 0
+	for i, ft := range fts {
+
+		e = s + int32(ft.N)
+
+		sp := estimatePoly(xs, ys, ft, s, e)
+		spans[i] = sp
+		s = e
+	}
+
+	for i, sp := range spans[:len(spans)-1] {
+		sp2 := spans[i+1]
+		merged[i] = mergeTwoSpan(xs, ys, sp, sp2)
+	}
+
+	for len(merged) > 0 {
+
+		// find minimal merge and merge
+
+		maxReduced := -1
+		maxI := 0
+
+		for i := 1; i < len(merged); i++ {
+			a := spans[i]
+			b := spans[i+1]
+			mr := merged[i]
+			reduced := a.mem + b.mem - mr.mem
+			if maxReduced < a.mem+b.mem-mr.mem {
+				maxI = i
+				maxReduced = reduced
+			}
+		}
+
+		if maxReduced > 0 {
+
+			spans[maxI] = mergeTwoSpan(xs, ys, spans[maxI], spans[maxI+1])
+			spans = append(spans[:maxI+1], spans[maxI+2:]...)
+			if maxI > 0 {
+				merged[maxI-1] = mergeTwoSpan(xs, ys, spans[maxI-1], spans[maxI])
+			}
+
+			merged = append(merged[:maxI], merged[maxI+1:]...)
+
+			if maxI < len(spans)-1 {
+				merged[maxI] = mergeTwoSpan(xs, ys, spans[maxI], spans[maxI+1])
+			}
+		} else {
+			// Even the minimal merge does not reduce memory cost.
+			break
+		}
+	}
+
+	return spans
+}
+
+func mergeTwoSpan(xs, ys []float64, a, b span) span {
+	ft := mergeTwoFitting(a.ft, b.ft)
+	sp := estimatePoly(xs, ys, ft, a.s, b.e)
+	return sp
+}
+
+func estimatePoly(xs, ys []float64, ft *polyfit.Fitting, s, e int32) span {
+
+	poly := ft.Solve(true)
+	max, min := maxminResiduals(poly, xs[s:e], ys[s:e])
+	margin := int32(math.Ceil(max - min))
+	poly[0] += min
+
+	residualWidth := marginWidth(margin)
+	mem := memCost(poly, residualWidth, int32(ft.N))
+
+	return span{
+		ft:            ft,
+		poly:          poly,
+		residualWidth: residualWidth,
+		mem:           mem,
+		s:             s,
+		e:             e,
+	}
+}
+
+func mergeTwoFitting(a, b *polyfit.Fitting) *polyfit.Fitting {
+
+	f := polyfit.NewFitting(nil, nil, a.Degree)
+	f.Merge(a)
+	f.Merge(b)
+
+	return f
 }
 
 func marginWidth(margin int32) uint32 {
@@ -344,12 +397,10 @@ func marginWidth(margin int32) uint32 {
 	panic(fmt.Sprintf("margin is too large: %d >= 2^16", margin))
 }
 
-func memCost(poly []float64, eltWidth uint32, n int32) int {
+func memCost(poly []float64, residualWidth uint32, n int32) int {
 	mm := 0
-	mm += 64                             // PolySpan and PolySpanWidth
-	mm += 64 * len(poly)                 // Polynomials
-	mm += 32 * (len(poly) / polyCoefCnt) // Info
-	mm += int(eltWidth) * int(n)         // Words
+	mm += 64 * (len(poly) + 1)        // Polynomials and config
+	mm += int(residualWidth) * int(n) // Residuals
 	return mm
 }
 
@@ -361,7 +412,7 @@ func maxminResiduals(poly, xs, ys []float64) (float64, float64) {
 	max, min := float64(0), float64(0)
 
 	for i, x := range xs {
-		v := evalpoly(poly, x)
+		v := evalpoly2(poly, x)
 		diff := ys[i] - v
 		if diff > max {
 			max = diff
@@ -373,30 +424,3 @@ func maxminResiduals(poly, xs, ys []float64) (float64, float64) {
 
 	return max, min
 }
-
-// // polyStr convert a polynomial to string for human
-// //
-// // Since 0.5.2
-// func polyStr(poly []float64) string {
-
-//     elts := []string{}
-
-//     for i, coef := range poly {
-//         if coef == 0 {
-//             continue
-//         }
-
-//         cc := fmt.Sprintf("%.4f", coef)
-
-//         if i > 0 {
-//             cc += "x"
-//         }
-//         if i > 1 {
-//             cc += fmt.Sprintf("^%d", i)
-//         }
-
-//         elts = append(elts, cc)
-//     }
-
-//     return strings.Replace(strings.Join(elts, " + "), "+ -", "- ", -1)
-// }

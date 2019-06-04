@@ -35,7 +35,7 @@ func ExampleNewDense() {
 
 	// Unordered output:
 	// last elt is: 10000610
-	//  elt_width : 2
-	//   mem_elts : 56
-	//   bits/elt : 32
+	//  elt_width : 4
+	//   mem_elts : 40
+	//   bits/elt : 30
 }
