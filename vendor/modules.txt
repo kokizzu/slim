@@ -16,6 +16,7 @@ github.com/mattn/go-runewidth
 github.com/openacid/errors
 # github.com/openacid/low v0.1.7
 github.com/openacid/low/size
+github.com/openacid/low/iohelper
 github.com/openacid/low/bitword
 github.com/openacid/low/pbcmpl
 github.com/openacid/low/tree
