@@ -28,14 +28,16 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"math/bits"
 	"reflect"
 	"strings"
 
 	"github.com/blang/semver"
 	"github.com/openacid/errors"
+	"github.com/openacid/low/bitmap"
+	"github.com/openacid/low/bitmap/varbits"
 	"github.com/openacid/low/bitword"
 	"github.com/openacid/low/pbcmpl"
+	"github.com/openacid/low/sigbits"
 	"github.com/openacid/low/tree"
 	"github.com/openacid/low/vers"
 	"github.com/openacid/slim/array"
@@ -68,13 +70,17 @@ const (
 //
 // Since 0.2.0
 type SlimTrie struct {
-	Children array.Bitmap16
+	Children InnerNodes
 	Steps    array.U16
 	Leaves   array.Array
 }
 
 type versionedArray struct {
 	*array.Base
+}
+
+func (va *InnerNodes) GetVersion() string {
+	return slimtrieVersion
 }
 
 func (va *versionedArray) GetVersion() string {
@@ -108,9 +114,9 @@ func NewSlimTrie(e encode.Encoder, keys []string, values interface{}) (*SlimTrie
 }
 
 type subset struct {
-	keyStart  int
-	keyEnd    int
-	fromIndex int
+	keyStart  int32
+	keyEnd    int32
+	fromIndex int32
 }
 
 func newSlimTrie(e encode.Encoder, keys []string, values interface{}) (*SlimTrie, error) {
@@ -127,11 +133,15 @@ func newSlimTrie(e encode.Encoder, keys []string, values interface{}) (*SlimTrie
 		}
 	}
 
+	sb := sigbits.New(keys)
+	// lencounts := countBitLen(keys)
+
 	rvals := checkValues(reflect.ValueOf(values), n)
 	tokeep := newValueToKeep(rvals)
 
 	childi := make([]int32, 0, n)
-	childv := make([]uint64, 0, n)
+	childv := make([][]int32, 0, n)
+	childsize := make([]int32, 0, n)
 
 	stepi := make([]int32, 0, n)
 	stepv := make([]uint16, 0, n)
@@ -140,7 +150,7 @@ func newSlimTrie(e encode.Encoder, keys []string, values interface{}) (*SlimTrie
 	leavesv := make([]interface{}, 0, n)
 
 	queue := make([]subset, 0, n*2)
-	queue = append(queue, subset{0, n, 0})
+	queue = append(queue, subset{0, int32(n), 0})
 
 	for i := 0; i < len(queue); i++ {
 		nid := int32(i)
@@ -157,46 +167,45 @@ func newSlimTrie(e encode.Encoder, keys []string, values interface{}) (*SlimTrie
 		}
 
 		// need to create an inner node
+		wordStart, distinctCnt := sb.Distinct(s, e, 16)
 
-		prefI := prefixIndex(keys[s:e], o.fromIndex)
+		wordsize := findPropWordSize(distinctCnt)
 
-		// the first key is a prefix of all other keys, which makes it a leaf.
-		isFirstKeyALeaf := len(keys[s])*8/4 == prefI
-		if isFirstKeyALeaf {
-			if tokeep[s] {
-				leavesi = append(leavesi, nid)
-				leavesv = append(leavesv, getV(rvals, s))
+		bb := varbits.NewBitmapBuilder(wordsize)
+		ks := make([]string, 0)
+		for i := s; i < e; i++ {
+			if tokeep[i] {
+				ks = append(ks, keys[i])
 			}
-			s += 1
 		}
+		nodeBMIndexes := bb.BitPositions(ks, wordStart, true)
 
 		// create inner node from following keys
 
-		labels, labelBitmap := getLabels(keys[s:e], prefI, tokeep[s:e])
-
-		hasChildren := len(labels) > 0
+		hasChildren := len(nodeBMIndexes) > 0
 
 		if hasChildren {
 			childi = append(childi, nid)
-			childv = append(childv, uint64(labelBitmap))
+			childv = append(childv, nodeBMIndexes)
+			childsize = append(childsize, varbits.BitmapSize(wordsize))
 
 			// put keys with the same starting word to queue.
 
-			for _, label := range labels {
+			for _, idx := range nodeBMIndexes {
 
 				// Find the first key starting with label
 				for ; s < e; s++ {
-					word := bw4.Get(keys[s], prefI)
-					if word == label {
+					kidx := bb.BitPos(keys[s], wordStart)
+					if kidx == idx {
 						break
 					}
 				}
 
 				// Continue looking for the first key not starting with label
-				var j int
+				var j int32
 				for j = s + 1; j < e; j++ {
-					word := bw4.Get(keys[j], prefI)
-					if word != label {
+					kidx := bb.BitPos(keys[j], wordStart)
+					if kidx != idx {
 						break
 					}
 				}
@@ -204,14 +213,14 @@ func newSlimTrie(e encode.Encoder, keys []string, values interface{}) (*SlimTrie
 				p := subset{
 					keyStart:  s,
 					keyEnd:    j,
-					fromIndex: prefI + 1, // skip the label word
+					fromIndex: (wordStart + wordsize), // skip the label word
 				}
 				queue = append(queue, p)
 				s = j
 			}
 
 			// Exclude the label word at parent node
-			step := (prefI - o.fromIndex)
+			step := (wordStart - o.fromIndex)
 			if step > 0xffff {
 				panic(fmt.Sprintf("step=%d is too large. must < 2^16", step))
 			}
@@ -227,10 +236,7 @@ func newSlimTrie(e encode.Encoder, keys []string, values interface{}) (*SlimTrie
 
 	nodeCnt := int32(len(queue))
 
-	ch, err := array.NewBitmap16(childi, childv, 16)
-	if err != nil {
-		return nil, err
-	}
+	ch := newNodeArray(childi, childv, childsize)
 
 	steps, err := array.NewU16(stepi, stepv)
 	if err != nil {
@@ -246,7 +252,7 @@ func newSlimTrie(e encode.Encoder, keys []string, values interface{}) (*SlimTrie
 	}
 
 	// Avoid panic of slice index out of bound.
-	ch.ExtendIndex(nodeCnt)
+	ch.Index.Extend(nodeCnt)
 	steps.ExtendIndex(nodeCnt)
 	leaves.ExtendIndex(nodeCnt)
 
@@ -283,13 +289,13 @@ func newValueToKeep(rvals reflect.Value) []bool {
 	tokeep[0] = true
 
 	for i := 0; i < n-1; i++ {
-		tokeep[i+1] = getV(rvals, i+1) != getV(rvals, i)
+		tokeep[i+1] = getV(rvals, int32(i)+1) != getV(rvals, int32(i))
 	}
 	return tokeep
 }
 
-func getV(reflectSlice reflect.Value, i int) interface{} {
-	return reflectSlice.Index(i).Interface()
+func getV(reflectSlice reflect.Value, i int32) interface{} {
+	return reflectSlice.Index(int(i)).Interface()
 }
 
 func emptySlimTrie(e encode.Encoder) *SlimTrie {
@@ -298,36 +304,83 @@ func emptySlimTrie(e encode.Encoder) *SlimTrie {
 	return st
 }
 
-func prefixIndex(keys []string, from int) int {
-	if len(keys) == 1 {
-		return len(keys[0])
+// There are 2^x x-bits words, and 2^(x+1)-1 (0~x)-bits words.
+// We need a 2^(x+1) bitmap to store all words with length from 0 to x
+//
+// Because upper nodes have more full x-bits words and lower nodes have more
+// non-full x-bits words.
+//
+// Thus we separate full words and non-full words into 2 bitmap.
+//
+// For full words it requires 2^x bits
+// For non-full words it requires 2^y - 1 bits, where y is the longest
+// non-full words.
+//
+// Thus the entire bitmap size is 2^x + 2^y - 1, in binary form it is
+// 100..00100..000
+//
+// Thus when we get the size we can extract 2 sizes from it by finding 2
+// "1" in it.
+//
+// And we use 1 bit to indicate which one is the full-word bitmap.
+//
+// Encoding a binary tree
+// In a tree, leaf nodes are x-bits word, inner nodes are words with less
+// than x.
+//
+// Recursively put nodes in order:
+// node, left-tree, right-right
+//
+// to locate a bit for a searching path p:
+// index = 2 p + rank0(p)
+//
+// p may have less than x steps for a inner node.
+func findPropWordSize(distinctCnt []int32) int32 {
+
+	l := int32(len(distinctCnt))
+	max := distinctCnt[l-1]
+
+	// Ratio of storing words directly to storing with bitmap, for every word size in percentage:
+	// Ratio = actual-data-size / bitmap-size
+	// If storing them requires less space than with a bitmap, stop looking
+	// up.
+	// If not a lot space is wasted, we prefer to use as a larger bitmap as
+	// possible.
+	ratio := make([]int32, l)
+
+	for i := int32(1); i < l; i++ {
+		width := i
+		bmsize := varbits.BitmapSize(width)
+		ratio[i] = distinctCnt[i] * width * 100 / bmsize
 	}
 
-	n := len(keys)
+	rst := int32(1)
+	for ; rst < l && distinctCnt[rst] == 1; rst++ {
+	}
+	for ; rst < l-1 && ratio[rst+1] >= 25 && distinctCnt[rst] < max; rst++ {
+	}
+	for ; rst > 1 && distinctCnt[rst] == distinctCnt[rst-1]; rst-- {
 
-	end := bw4.FirstDiff(keys[0], keys[n-1], from, -1)
-	return end
+	}
+	return rst
 }
 
-func getLabels(keys []string, from int, tokeep []bool) ([]byte, uint16) {
-	labels := make([]byte, 0, 1<<4)
-	bitmap := uint16(0)
+// rst[i] means the number of keys of length i, in bit.
+func countBitLen(keys []string) []int32 {
+	max := 0
+	for _, k := range keys {
+		l := len(k) * 8
 
-	for i, k := range keys {
-
-		if !tokeep[i] {
-			continue
+		if max < l {
+			max = l
 		}
-
-		word := bw4.Get(k, from)
-		b := uint16(1) << word
-		if bitmap&b == 0 {
-			labels = append(labels, word)
-			bitmap |= b
-		}
-
 	}
-	return labels, bitmap
+	rst := make([]int32, max+1)
+	for _, k := range keys {
+		l := len(k) * 8
+		rst[l]++
+	}
+	return rst
 }
 
 // RangeGet look for a range that contains a key in SlimTrie.
@@ -402,72 +455,64 @@ func (st *SlimTrie) Search(key string) (lVal, eqVal, rVal interface{}) {
 // The id of smallest key > `key`. It is -1 if `key` is the greatest.
 func (st *SlimTrie) searchID(key string) (lID, eqID, rID int32) {
 	lID, eqID, rID = -1, 0, -1
-	lIsLeaf := false
 
-	// string to 4-bit words
-	lenWords := 2 * len(key)
+	lenWords := int32(8 * len(key))
 
-	for i := -1; ; {
-		bitmap, child0Id, hasChildren := st.getChild(eqID)
+	for i := int32(0); i <= lenWords; {
+
+		hasChildren := st.Children.Index.Has(eqID)
 		if !hasChildren {
 			break
 		}
 
-		i += int(st.getStep(eqID))
-
-		if lenWords < i {
+		step, _ := st.Steps.Get(eqID)
+		i += int32(step)
+		if i > lenWords {
 			rID = eqID
 			eqID = -1
 			break
 		}
 
-		if lenWords == i {
-			rID = child0Id
-			break
+		var l, r int32
+		var bmsize int32
+		var childID int32
+
+		from, to := st.Children.nodeBitRange(eqID)
+
+		bmsize, l, childID = st.Children.getLabelRank(eqID, key, i)
+
+		// TODO l, r check boundary
+		r = childID + 1
+
+		lparent := st.Children.getParentBitPos(l)
+		rparent := st.Children.getParentBitPos(r)
+
+		if lparent >= from && lparent < to {
+			lID = l
+		}
+		if rparent >= from && rparent < to {
+			rID = r
 		}
 
-		shift := 4 - (i&1)*4
-		word := ((key[i>>1] >> uint(shift)) & 0x0f)
-		wordBit := uint16(1) << uint(word)
-		branchBit := bitmap & wordBit
-
-		// This is a inner node at eqIdx,
-		// update eq, and left right closest node
-
-		hasLeaf := st.Leaves.Has(eqID)
-
-		if hasLeaf {
-			lID = eqID
-			lIsLeaf = true
-		}
-
-		// Count of branch on the left
-		lCnt := bits.OnesCount16(bitmap & (wordBit - 1))
-
-		if branchBit != 0 {
-			eqID = child0Id + int32(lCnt)
-		} else {
+		if l == childID {
 			eqID = -1
-		}
-
-		if lCnt > 0 {
-			lID = child0Id + int32(lCnt) - 1
-			lIsLeaf = false
-		}
-		// Might overflow but ok
-		if bitmap > (wordBit<<1)-1 {
-			rID = child0Id + int32(lCnt) + int32(branchBit>>uint16(word))
-		}
-
-		if branchBit == 0 {
 			break
+		}
+		eqID = childID
+		i += varbits.MaxbitsOfBitmap(bmsize)
+	}
+
+	if eqID != -1 {
+
+		hasChildren := st.Children.Index.Has(eqID)
+		if hasChildren {
+			rID = eqID
+			eqID = -1
 		}
 	}
 
 	if lID != -1 {
-		if !lIsLeaf {
-			lID = st.rightMost(lID)
-		}
+		lID = st.rightMost(lID)
 	}
 	if rID != -1 {
 		rID = st.leftMost(rID)
@@ -490,46 +535,31 @@ func (st *SlimTrie) searchID(key string) (lID, eqID, rID int32) {
 // Since 0.2.0
 func (st *SlimTrie) Get(key string) (eqVal interface{}, found bool) {
 
-	var word byte
 	found = false
 	eqID := int32(0)
 
-	// string to 4-bit words
-	lenWords := 2 * len(key)
+	// count in bit
+	lenWords := int32(8 * len(key))
 
-	for idx := -1; ; {
+	for idx := int32(0); idx <= lenWords; {
 
-		bm, rank, hasInner := st.Children.GetWithRank(eqID)
+		hasInner := st.Children.Index.Has(eqID)
 		if !hasInner {
 			// maybe a leaf
 			break
 		}
 
 		step, _ := st.Steps.Get(eqID)
-		idx += 1 + int(step)
+		idx += int32(step)
 
-		if lenWords < idx {
-			eqID = -1
-			break
+		var xx int32
+		var bmsize int32
+		bmsize, xx, eqID = st.Children.getLabelRank(eqID, key, idx)
+		if xx == eqID {
+			// no such branch of label
+			return nil, false
 		}
-
-		if lenWords == idx {
-			break
-		}
-
-		// Get a 4-bit word from 8-bit words.
-		// Use arithmetic to avoid branch missing.
-		shift := 4 - (idx&1)*4
-		word = ((key[idx>>1] >> uint(shift)) & 0x0f)
-
-		bb := uint64(1) << word
-		if bm&bb != 0 {
-			chNum := bits.OnesCount64(bm & (bb - 1))
-			eqID = rank + 1 + int32(chNum)
-		} else {
-			eqID = -1
-			break
-		}
+		idx += varbits.MaxbitsOfBitmap(bmsize)
 	}
 
 	if eqID != -1 {
@@ -555,25 +585,28 @@ func (st *SlimTrie) getStep(idx int32) uint16 {
 
 func (st *SlimTrie) leftMost(idx int32) int32 {
 	for {
+
 		if st.Leaves.Has(idx) {
 			return idx
 		}
 
-		_, idx, _ = st.getChild(idx)
+		b := st.Children
+		from, _ := b.nodeBitRange(idx)
+
+		r0, _ := bitmap.Rank128(b.Elts.Words, b.Elts.RankIndex, from)
+		idx = r0 + 1
 	}
 }
 
 func (st *SlimTrie) rightMost(idx int32) int32 {
 	for {
-		bm, of, found := st.getChild(idx)
-		if !found {
+		if st.Leaves.Has(idx) {
 			return idx
 		}
 
-		// count number of all children
-		chNum := bits.OnesCount16(bm)
-		idx = of + int32(chNum-1)
-
+		b := st.Children
+		_, to := b.nodeBitRange(idx)
+		_, idx = bitmap.Rank128(b.Elts.Words, b.Elts.RankIndex, to-1)
 	}
 }
 
@@ -584,7 +617,7 @@ func (st *SlimTrie) Marshal() ([]byte, error) {
 	var buf []byte
 	writer := bytes.NewBuffer(buf)
 
-	_, err := pbcmpl.Marshal(writer, &versionedArray{&st.Children.Base})
+	_, err := pbcmpl.Marshal(writer, &st.Children)
 	if err != nil {
 		return nil, errors.WithMessage(err, "failed to marshal children")
 	}
@@ -602,25 +635,41 @@ func (st *SlimTrie) Marshal() ([]byte, error) {
 	return writer.Bytes(), nil
 }
 
-// Unmarshal de-serializes and loads SlimTrie from a byte stream.
+// Unmarshal de-serializes and ratio SlimTrie from a byte stream.
 //
 // Since 0.4.3
 func (st *SlimTrie) Unmarshal(buf []byte) error {
 
 	var ver string
+	var err error
+	var children *array.Bitmap16
 	compatible := st.compatibleVersions()
 	reader := bytes.NewReader(buf)
 
-	_, ver, err := pbcmpl.Unmarshal(reader, &st.Children)
+	_, h, err := pbcmpl.ReadHeader(reader)
 	if err != nil {
-		return errors.WithMessage(err, "failed to unmarshal children")
+		return errors.WithMessage(err, "failed to unmarshal header")
 	}
+
+	ver = h.GetVersion()
 
 	if !vers.IsCompatible(ver, compatible) {
 		return errors.Wrapf(ErrIncompatible,
 			fmt.Sprintf(`version: "%s", compatible versions:"%s"`,
 				ver,
 				strings.Join(compatible, " || ")))
+	}
+
+	reader = bytes.NewReader(buf)
+
+	if checkVer(ver, "==1.0.0 || <0.5.10") {
+		children = &array.Bitmap16{}
+		_, _, err = pbcmpl.Unmarshal(reader, children)
+	} else {
+		_, _, err = pbcmpl.Unmarshal(reader, &st.Children)
+	}
+	if err != nil {
+		return errors.WithMessage(err, "failed to unmarshal children")
 	}
 
 	_, _, err = pbcmpl.Unmarshal(reader, &st.Steps)
@@ -635,9 +684,9 @@ func (st *SlimTrie) Unmarshal(buf []byte) error {
 
 	// backward compatible:
 
-	before058ConvertToChildrenEltsToBMElts(st, ver)
-	before059ExtendBitmapIndex(st, ver)
-	before0510StepFrom0(st, ver)
+	before058(st, ver, children)
+	eq058(st, ver, children)
+	eq059(st, ver, children)
 
 	return nil
 }
@@ -656,7 +705,33 @@ func checkVer(ver string, want string) bool {
 	return chk(v)
 }
 
-func before058ConvertToChildrenEltsToBMElts(st *SlimTrie, ver string) {
+func before058(st *SlimTrie, ver string, ch *array.Bitmap16) {
+	if !checkVer(ver, "==1.0.0 || <0.5.8") {
+		return
+	}
+	before000510Step(st, ver, ch)
+	before000510ToNewChildrenArray(st, ver, ch)
+	before000509ExtendBitmapIndex(st, ver, ch)
+}
+
+func eq058(st *SlimTrie, ver string, ch *array.Bitmap16) {
+	if !checkVer(ver, "==0.5.8") {
+		return
+	}
+	before000510Step(st, ver, ch)
+	before000510ToNewChildrenArray(st, ver, ch)
+	before000509ExtendBitmapIndex(st, ver, ch)
+}
+
+func eq059(st *SlimTrie, ver string, ch *array.Bitmap16) {
+	if !checkVer(ver, "==0.5.9") {
+		return
+	}
+	before000510Step(st, ver, ch)
+	before000510ToNewChildrenArray(st, ver, ch)
+}
+
+func before000510ToNewChildrenArray(st *SlimTrie, ver string, ch *array.Bitmap16) {
 
 	// 1.0.0 is the initial version.
 	// From 0.5.8 it starts writing version to marshaled data.
@@ -665,37 +740,167 @@ func before058ConvertToChildrenEltsToBMElts(st *SlimTrie, ver string) {
 
 	// Convert u32 node to ranked bitmap node
 
-	if checkVer(ver, "==1.0.0 || <0.5.8") {
+	if checkVer(ver, "==1.0.0 || <0.5.10") {
 
 		// There are two format with version 1.0.0:
 		// Before 0.5.4 Children elements are in Elts
 		// From 0.5.4 Children elements are in BMElts
 
-		if st.Children.Flags&array.ArrayFlagIsBitmap == 0 {
+		//  rebuild nodes
 
-			var endian = binary.LittleEndian
+		childi := make([]int32, 0)
+		childv := make([][]int32, 0)
+		childsize := make([]int32, 0)
 
-			b := &st.Children
-			b.Flags |= array.ArrayFlagHasEltWidth | array.ArrayFlagIsBitmap
-			b.EltWidth = 16
+		stepi := make([]int32, 0)
+		stepv := make([]uint16, 0)
 
-			indexes := b.Indexes()
-			elts := make([]uint64, len(indexes))
-			for i, idx := range indexes {
-				eltIdx, found := b.GetEltIndex(idx)
-				if !found {
-					panic("not found index???")
-				}
-				v := endian.Uint32(b.Elts[eltIdx*4:])
-				elts[i] = uint64(v & 0xffff)
-			}
-			b.BMElts = array.NewBitsJoin(elts, b.EltWidth, false).(*array.Bits)
-			b.Elts = nil
+		leavesi := make([]int32, 0)
+		leavesv := make([]interface{}, 0)
+
+		type qq struct {
+			oldid  int32
+			isLeaf bool
 		}
+
+		q := make([]*qq, 0)
+		q = append(q, &qq{oldid: 0, isLeaf: false})
+
+		nextAddOldid := int32(1)
+
+		for newid := int32(0); newid < int32(len(q)); newid++ {
+			qelt := q[newid]
+
+			if qelt.isLeaf {
+				continue
+			}
+
+			oldid := qelt.oldid
+			hasLeaf := st.Leaves.Has(oldid)
+			hasInner := ch.Has(oldid)
+
+			if hasInner {
+				if hasLeaf {
+					// an inner node is also play as a leaf. In 0.5.10, separate them.
+					q = append(q, &qq{oldid: oldid, isLeaf: true})
+				}
+				words := getOldChild(ch, oldid)
+				for range words {
+					ee := &qq{oldid: nextAddOldid, isLeaf: false}
+					q = append(q, ee)
+					nextAddOldid++
+				}
+			} else {
+				if hasLeaf {
+					qelt.isLeaf = true
+				} else {
+					panic("no inner no leaf??")
+				}
+			}
+		}
+
+		for newid, qelt := range q {
+			oldid := qelt.oldid
+			if !qelt.isLeaf {
+				childi = append(childi, int32(newid))
+				words := getOldChild(ch, oldid)
+				vbm := toVarBMIndexes(words)
+				if st.Leaves.Has(oldid) {
+					// "" is a explicit branch in 0.5.10
+					vbm = append([]int32{0}, vbm...)
+				}
+				childv = append(childv, vbm)
+				childsize = append(childsize, 32)
+
+			}
+
+			if !qelt.isLeaf && st.Steps.Has(oldid) {
+				stepi = append(stepi, int32(newid))
+				stp, found := st.Steps.Get(oldid)
+				if !found {
+					panic("step not found??")
+				}
+				stepv = append(stepv, stp)
+			}
+
+			if qelt.isLeaf && st.Leaves.Has(oldid) {
+				leavesi = append(leavesi, int32(newid))
+				lv, found := st.Leaves.Get(oldid)
+				if !found {
+					panic("leaf not found??")
+				}
+				leavesv = append(leavesv, lv)
+			}
+
+		}
+
+		// create
+		{
+
+			ch := newNodeArray(childi, childv, childsize)
+
+			steps, err := array.NewU16(stepi, stepv)
+			if err != nil {
+				panic("create steps error??")
+			}
+
+			leaves := array.Array{}
+			leaves.EltEncoder = st.Leaves.EltEncoder
+
+			err = leaves.Init(leavesi, leavesv)
+			if err != nil {
+				panic("create leaves error??")
+			}
+			st.Children = *ch
+			st.Steps = *steps
+			st.Leaves = leaves
+
+		}
+
 	}
 }
 
-func before059ExtendBitmapIndex(st *SlimTrie, ver string) {
+func toVarBMIndexes(words []int32) []int32 {
+	varbm := make([]int32, len(words))
+	for i, pos := range words {
+		b := varbits.New(uint64(pos), 4, 4)
+		varbm[i] = varbits.ToIndex(b)
+	}
+
+	return varbm
+}
+
+func getOldChild(ch *array.Bitmap16, idx int32) []int32 {
+
+	endian := binary.LittleEndian
+
+	var barray []int32
+	eltIdx, found := ch.GetEltIndex(idx)
+
+	if !found {
+		panic("not found index???")
+	}
+
+	if ch.Flags&array.ArrayFlagIsBitmap == 0 {
+
+		// load from Base.Elts
+
+		v := endian.Uint32(ch.Elts[eltIdx*4:])
+		barray = bitmap.ToArray([]uint64{uint64(v & 0xffff)})
+
+	} else {
+
+		// load from Base.BMElts
+
+		wordI := eltIdx * 16 / 64
+		j := eltIdx * 16 % 64
+		v := ch.BMElts.Words[wordI] >> uint(j)
+		barray = bitmap.ToArray([]uint64{v & 0xffff})
+	}
+	return barray
+}
+
+func before000509ExtendBitmapIndex(st *SlimTrie, ver string, ch *array.Bitmap16) {
 
 	// From 0.5.9 it create aligned array bitmap.
 	// Need to align array bitmap for previous versions.
@@ -703,8 +908,8 @@ func before059ExtendBitmapIndex(st *SlimTrie, ver string) {
 	if checkVer(ver, "==1.0.0 || <0.5.9") {
 
 		n := 0
-		if n < len(st.Children.Bitmaps)*64 {
-			n = len(st.Children.Bitmaps) * 64
+		if n < len(ch.Bitmaps)*64 {
+			n = len(ch.Bitmaps) * 64
 		}
 		if n < len(st.Steps.Bitmaps)*64 {
 			n = len(st.Steps.Bitmaps) * 64
@@ -714,15 +919,16 @@ func before059ExtendBitmapIndex(st *SlimTrie, ver string) {
 		}
 
 		nodeCnt := int32(n)
-		st.Children.ExtendIndex(nodeCnt)
+		st.Children.Index.Extend(nodeCnt)
 		st.Steps.ExtendIndex(nodeCnt)
 		st.Leaves.ExtendIndex(nodeCnt)
 	}
 }
 
-func before0510StepFrom0(st *SlimTrie, ver string) {
+func before000510Step(st *SlimTrie, ver string, ch *array.Bitmap16) {
 
 	// From 0.5.10 step does not include the count of the label word.
+	// From 0.5.10 step is in bit instead of in 4-bit.
 
 	if checkVer(ver, "==1.0.0 || <0.5.10") {
 
@@ -735,6 +941,12 @@ func before0510StepFrom0(st *SlimTrie, ver string) {
 
 			v -= 1
 
+			if v > 0xffff/4 {
+				panic("old step is too large")
+			}
+
+			v *= 4
+
 			st.Steps.Elts[i*2] = byte(v)
 			st.Steps.Elts[i*2+1] = byte(v >> 8)
 		}
@@ -745,7 +957,7 @@ func before0510StepFrom0(st *SlimTrie, ver string) {
 //
 // Since 0.4.3
 func (st *SlimTrie) Reset() {
-	st.Children.Array32.Reset()
+	st.Children.Reset()
 	st.Steps.Array32.Reset()
 	st.Leaves.Array32.Reset()
 }
@@ -769,7 +981,25 @@ func (st *SlimTrie) Reset() {
 //
 // Since 0.4.3
 func (st *SlimTrie) String() string {
-	s := &slimTrieStringly{st: st}
+	s := &slimTrieStringly{
+		st: st,
+		inners: st.Children.Index.
+			ToArray(),
+		labels: make(map[int32]map[string]int32),
+	}
+	ch := st.Children
+	for _, n := range s.inners {
+		labels := ch.labels(n)
+
+		s.labels[n] = make(map[string]int32)
+		for _, l := range labels {
+			idx := varbits.ToIndex(l)
+			_, r1 := s.st.Children.getChildRank(n, idx)
+			lstr := varbits.Str(l)
+			s.labels[n][lstr] = r1
+		}
+	}
+
 	return tree.String(s)
 }
 

@@ -1,6 +1,7 @@
 package trie
 
 import (
+	"fmt"
 	"reflect"
 	"testing"
 
@@ -496,27 +497,27 @@ func TestToStrings(t *testing.T) {
 
 	expect := `
 *3
--097->
-      -098->*2
-            -099->*2
-                  -00$->=0
-                  -100->
-                        -00$->=1
-            -100->*2
-                  -00$->=2
-                  -101->
-                        -00$->=3
--098->
-      -099->*2
-            -00$->=4
-            -100->*2
-                  -00$->=5
-                  -101->
-                        -00$->=6
--099->
-      -100->
-            -101->
-                  -00$->=7`[1:]
+-97->
+     -98->*2
+          -99->*2
+               -$->=0
+               -100->
+                     -$->=1
+          -100->*2
+                -$->=2
+                -101->
+                      -$->=3
+-98->
+     -99->*2
+          -$->=4
+          -100->*2
+                -$->=5
+                -101->
+                      -$->=6
+-99->
+     -100->
+           -101->
+                 -$->=7`[1:]
 
 	var trie, _ = NewTrie(keys, values, false)
 	trie, err := NewTrie(keys, values, false)
@@ -547,23 +548,24 @@ func TestTrie_removeSameLeaf(t *testing.T) {
 
 	want := `
 *2
--097->
-      -098->*2
-            -099->
-                  -00$->=0
-            -100->
-                  -101->
-                        -00$->=3
--098->
-      -099->*2
-            -00$->=4
-            -100->
-                  -00$->=5`[1:]
+-97->
+     -98->*2
+          -99->
+               -$->=0
+          -100->
+                -101->
+                      -$->=3
+-98->
+     -99->*2
+          -$->=4
+          -100->
+                -$->=5`[1:]
 
 	trie, err := NewTrie(keys, values, false)
 	ta.Nil(err)
 
 	trie.removeSameLeaf()
+	fmt.Println(trie)
 
 	ta.Equal(want, trie.String())
 	ta.Equal(9, trie.NodeCnt, "non-leaf node count")

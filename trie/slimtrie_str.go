@@ -2,7 +2,7 @@ package trie
 
 import (
 	"fmt"
-	"math/bits"
+	"sort"
 )
 
 // slimTrieStringly is a wrapper that implements tree.Tree .
@@ -10,7 +10,10 @@ import (
 //
 // Since 0.5.1
 type slimTrieStringly struct {
-	st *SlimTrie
+	st     *SlimTrie
+	inners []int32
+	// node, label(varbits), node
+	labels map[int32]map[string]int32
 }
 
 // Child implements tree.Tree
@@ -18,15 +21,9 @@ type slimTrieStringly struct {
 // Since 0.5.1
 func (s *slimTrieStringly) Child(node, branch interface{}) interface{} {
 
-	b := branch.(int)
-
-	bitmap, child0ID, _ := s.st.getChild(stNodeID(node))
-	if bitmap&(1<<uint(b)) != 0 {
-		nth := bits.OnesCount16(bitmap << (16 - uint16(b)))
-		return child0ID + int32(nth)
-	} else {
-		return nil
-	}
+	n := stNodeID(node)
+	b := branch.(string)
+	return s.labels[n][b]
 }
 
 // Labels implements tree.Tree
@@ -34,17 +31,20 @@ func (s *slimTrieStringly) Child(node, branch interface{}) interface{} {
 // Since 0.5.1
 func (s *slimTrieStringly) Labels(node interface{}) []interface{} {
 
-	rst := []interface{}{}
+	n := stNodeID(node)
 
-	bitmap, _, _ := s.st.getChild(stNodeID(node))
-
-	for b := uint(0); b < 16; b++ {
-		if bitmap&(1<<b) > 0 {
-			rst = append(rst, int(b))
-		}
+	rst := []string{}
+	labels := s.labels[n]
+	for l := range labels {
+		rst = append(rst, l)
 	}
+	sort.Strings(rst)
 
-	return rst
+	r := []interface{}{}
+	for _, x := range rst {
+		r = append(r, x)
+	}
+	return r
 }
 
 // NodeID implements tree.Tree
@@ -58,7 +58,7 @@ func (s *slimTrieStringly) NodeID(node interface{}) string {
 //
 // Since 0.5.1
 func (s *slimTrieStringly) LabelInfo(label interface{}) string {
-	return fmt.Sprintf("%d", label)
+	return label.(string)
 }
 
 // NodeInfo implements tree.Tree

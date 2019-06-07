@@ -19,6 +19,7 @@ var (
 )
 
 func main() {
-	trie.MakeMarshaledData("slimtrie-data-11-%s", keys11)
-	trie.MakeMarshaledData("slimtrie-data-%s", nil)
+	for prf, ks := range trie.marshalCases {
+		trie.MakeMarshaledData(pref+"%s", ks)
+	}
 }

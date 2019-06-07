@@ -10,10 +10,6 @@ import (
 
 func MakeMarshaledData(fn string, keys []string) {
 
-	if len(keys) == 0 {
-		keys = keys50k
-	}
-
 	n := len(keys)
 	values := make([]int32, n)
 	for i := 0; i < n; i++ {

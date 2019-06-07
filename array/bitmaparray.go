@@ -1,6 +1,8 @@
 package array
 
-import "math/bits"
+import (
+	"math/bits"
+)
 
 type Bitmap16 struct {
 	Base

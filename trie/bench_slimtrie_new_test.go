@@ -22,7 +22,7 @@ func BenchmarkNewSlimTrie(b *testing.B) {
 		if err != nil {
 			panic(err)
 		}
-		s += int(st.Children.Cnt)
+		s += int(st.Children.Index.Cnt())
 	}
 
 	Output = s

@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+option go_package = "trie";
+
+// Bitmap is an array of bits.
+//
+// Since 0.5.10
+message Bitmap {
+
+    // Words contains bitmap
+    //
+    // Since 0.5.10
+    repeated uint64 Words = 20;
+
+
+    // RankIndex speeds up rank() by pre-calcuate it
+    //
+    // Since 0.5.10
+    repeated int32 RankIndex = 30;
+
+
+    // SelectIndex speeds up select() by pre-calcuate it
+    //
+    // Since 0.5.10
+    repeated int32 SelectIndex = 40;
+}
+
+// InnerNodes is array of all inner nodes in slim trie.
+// It is NOT a public type and do not rely on it.
+// Since protobuf just makes all message public.
+//
+// Since 0.5.10
+message InnerNodes {
+
+
+    // Flags provides options
+    //
+    // Since 0.5.10
+    uint32 Flags = 10;
+
+
+    // Index is a bitmap in which a "1" indicates the i-th element exists.
+    //
+    // Since 0.5.10
+    Bitmap Index = 20;
+
+
+    // Elts is a array of var-length node label bitmaps.
+    // The size of an element bitmap is aligned to 4.
+    //
+    // Since 0.5.10
+    Bitmap Elts = 30;
+
+
+    // Starts is a bitmap in which the i-th "1" is where the i-th element
+    // starts.
+    // To get the start position of i-th element:
+    //     s := Starts.Select(i)
+    //
+    // To get the end position of i-th element:
+    //     e := Starts.Select(i+1)
+    //
+    // Since 0.5.10
+    Bitmap Starts = 40;
+}

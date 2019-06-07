@@ -32,4 +32,15 @@ message Array32 {
     //
     // Since 0.5.4
     Bits BMElts = 30;
+
+
+    // EltIndex is a bitmap in which a "1" indicate element start.
+    // To get the start position of i-th element:
+    //     s := EltIndex.Select(i)
+    //
+    // To get the end position of i-th element:
+    //     e := EltIndex.Select(i+1)
+    //
+    // Since 0.5.10
+    Bits EltIndex = 40;
 }

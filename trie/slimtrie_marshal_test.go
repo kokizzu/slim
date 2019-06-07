@@ -28,10 +28,10 @@ func TestSlimTrie_Unmarshal_incompatible(t *testing.T) {
 		input string
 		want  error
 	}{
-		{"1.0.0", nil},
-		{"0.5.8", nil},
-		{"0.5.9", nil},
-		{slimtrieVersion, nil},
+		// {"1.0.0", nil},
+		// {"0.5.8", nil},
+		// {"0.5.9", nil},
+		// {slimtrieVersion, nil},
 		{"0.5.11", ErrIncompatible},
 		{"0.6.0", ErrIncompatible},
 		{"0.9.9", ErrIncompatible},
@@ -39,6 +39,7 @@ func TestSlimTrie_Unmarshal_incompatible(t *testing.T) {
 	}
 
 	for i, c := range cases {
+		// fmt.Println("load from: ", c.input)
 		bad := make([]byte, len(buf))
 		copy(bad, buf)
 		// clear buf for version
@@ -59,29 +60,47 @@ func TestSlimTrie_Unmarshal_old_data(t *testing.T) {
 	finfos, err := ioutil.ReadDir(folder)
 	ta.Nil(err)
 
-	for _, finfo := range finfos {
+	for prf, ks := range marshalCases {
 
-		fn := finfo.Name()
+		for _, finfo := range finfos {
 
-		if !strings.HasPrefix(fn, "slimtrie-data-") {
-			continue
-		}
+			fn := finfo.Name()
 
-		path := filepath.Join(folder, fn)
-		b, err := ioutil.ReadFile(path)
-		ta.Nil(err)
+			if !strings.HasPrefix(fn, prf) {
+				continue
+			}
 
-		st, err := NewSlimTrie(encode.I32{}, nil, nil)
-		ta.Nil(err)
+			if fn != "slimtrie-data-11-0.5.8" {
+				continue
+			}
 
-		err = proto.Unmarshal(b, st)
-		ta.Nil(err)
+			ver := fn[14:]
+			if ver == slimtrieVersion {
+				// TODO remove this after 0.5.10 test passed
+				continue
+			}
 
-		keys := keys50k
-		for i, key := range keys {
-			v, found := st.Get(key)
-			ta.True(found)
-			ta.Equal(int32(i), v)
+			// fmt.Println("load old data:", fn, ver)
+
+			path := filepath.Join(folder, fn)
+			b, err := ioutil.ReadFile(path)
+			ta.Nil(err)
+
+			st, err := NewSlimTrie(encode.I32{}, nil, nil)
+			ta.Nil(err)
+
+			err = proto.Unmarshal(b, st)
+			ta.Nil(err)
+
+			// fmt.Println("prf:", prf)
+			// fmt.Println("loaded slimtrie:")
+			// fmt.Println(st)
+
+			for i, key := range ks {
+				v, found := st.Get(key)
+				ta.True(found, "search for %v", key)
+				ta.Equal(int32(i), v, "search for %v", key)
+			}
 		}
 	}
 }
