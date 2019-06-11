@@ -12,26 +12,26 @@ import (
 
 const (
 	maxResidualWidth = 16
-	minSpanSize      = int32(16)
+	minSpan          = int32(16)
 
-	segmentSize = 1024
-	segWidth    = uint(10)
-	segMask     = int32(1024 - 1)
+	segSize      = 1024
+	segSizeShift = uint(10)
+	segSizeMask  = int32(1024 - 1)
 
 	polyDegree      = 2
 	polyCoefCnt     = polyDegree + 1
 	f64PerSpan      = polyCoefCnt + 1 // 3 coefficients and 1 config
-	f64PerSpanShift = 2               // 3 coefficients and 1 config
+	f64PerSpanShift = 2
 	twoPow36        = float64(int64(1) << 36)
 
 	// In a segment we want:
-	//	residual position = offset + (i%1024) * residualWidth
+	//		residual position = offset + (i%1024) * residualWidth
 	// But if preceding span has smaller residual width, the "offset" could be
 	// negative, e.g.: span[0] has residual of width 0 and 16 residuals,
 	// span[1] has residual of width 4.
 	// Then the "offset" of span[1] is -16*4 in order to satisify:
 	// (-16*4) + i * 4 is the correct residual position, for i in [16, 32).
-	maxNegOffset = int64(segWidth) * int64(maxResidualWidth)
+	maxNegOffset = int64(segSize) * int64(maxResidualWidth)
 )
 
 // evalpoly2 evaluates a polynomial with degree=2.
@@ -54,8 +54,8 @@ func NewPolyArray(nums []int32) *PolyArray {
 		N: int32(len(nums)),
 	}
 
-	for ; len(nums) > segmentSize; nums = nums[segmentSize:] {
-		pa.addSeg(nums[:segmentSize])
+	for ; len(nums) > segSize; nums = nums[segSize:] {
+		pa.addSeg(nums[:segSize])
 	}
 	if len(nums) > 0 {
 		pa.addSeg(nums)
@@ -74,10 +74,10 @@ func NewPolyArray(nums []int32) *PolyArray {
 // Since 0.5.2
 func (m *PolyArray) Get(i int32) int32 {
 
-	bitmapI := (i >> segWidth) << 1
+	bitmapI := (i >> segSizeShift) << 1
 	polyBitmap, rank := m.Bitmap[bitmapI], m.Bitmap[bitmapI|1]
 
-	i = i & segMask
+	i = i & segSizeMask
 	x := float64(i)
 
 	bm := polyBitmap & bitmap.RightMasks[i>>4]
@@ -196,7 +196,7 @@ func newSeg(nums []int32, start int64) (uint64, []float64, []uint64) {
 	}
 
 	// create polynomial fit sessions for every 16 numbers
-	fts := initFittings(xs, ys, minSpanSize)
+	fts := initFittings(xs, ys, minSpan)
 
 	spans := findMinFittingsNew(xs, ys, fts)
 
@@ -227,7 +227,7 @@ func newSeg(nums []int32, start int64) (uint64, []float64, []uint64) {
 		polys = append(polys, sp.poly...)
 
 		// We want eltIndex = stBySeg + i * residualWidth
-		// min of stBySeg is -segWidth * residualWidth = -1024 * 16;
+		// min of stBySeg is -segmentSize * residualWidth = -1024 * 16;
 		// Add this value to make it a positive number.
 		offset := resI + start - int64(sp.s)*int64(width)
 		config := packConfig(offset+maxNegOffset, int64(width))

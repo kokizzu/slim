@@ -22,7 +22,7 @@ const _ = proto.ProtoPackageIsVersion2 // please upgrade the proto package
 //
 // The general idea
 //
-// We use a y = a + b x + c x^2 to describe trend of the numbers.
+// We use a polynomial y = a + b x + c x^2 to describe trend of the numbers.
 // And for every number we add a residual to fit the gap between y(i) and
 // nums[i].
 // E.g. If there are 4 numbers: 0, 15, 33, 50
@@ -39,7 +39,7 @@ const _ = proto.ProtoPackageIsVersion2 // please upgrade the proto package
 //
 // Data structure
 //
-// PolyArray splits the entire array into segment of 1024 elts.
+// PolyArray splits the entire array into segments, each of which has 1024 elts.
 // And then splits every segment into several spans.
 // Every span has its own polynomial. A span is of length = 16*k
 // Thus a segment has at most 64 spans.
@@ -51,7 +51,7 @@ const _ = proto.ProtoPackageIsVersion2 // please upgrade the proto package
 //     000101110000...(all 0)...1
 //     <-- least significant bit
 //
-// In the above example, there are 5 polinomials, each of them spans:
+// In the above example, there are 5 polynomials, each of them spans:
 // nums[0:64], nums[64:96], nums[96:112], nums[112:128], nums[128:1024]
 //
 // The "Bitmap" array allocates 2 uint64 for every segment:
@@ -82,7 +82,7 @@ func (m *PolyArray) Reset()         { *m = PolyArray{} }
 func (m *PolyArray) String() string { return proto.CompactTextString(m) }
 func (*PolyArray) ProtoMessage()    {}
 func (*PolyArray) Descriptor() ([]byte, []int) {
-	return fileDescriptor_polyarray_ca9acf8057c5185f, []int{0}
+	return fileDescriptor_polyarray_1e62764d7fc0beec, []int{0}
 }
 func (m *PolyArray) XXX_Unmarshal(b []byte) error {
 	return xxx_messageInfo_PolyArray.Unmarshal(m, b)
@@ -134,9 +134,9 @@ func init() {
 	proto.RegisterType((*PolyArray)(nil), "PolyArray")
 }
 
-func init() { proto.RegisterFile("polyarray.proto", fileDescriptor_polyarray_ca9acf8057c5185f) }
+func init() { proto.RegisterFile("polyarray.proto", fileDescriptor_polyarray_1e62764d7fc0beec) }
 
-var fileDescriptor_polyarray_ca9acf8057c5185f = []byte{
+var fileDescriptor_polyarray_1e62764d7fc0beec = []byte{
 	// 135 bytes of a gzipped FileDescriptorProto
 	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xe2, 0xe2, 0x2f, 0xc8, 0xcf, 0xa9,
 	0x4c, 0x2c, 0x2a, 0x4a, 0xac, 0xd4, 0x2b, 0x28, 0xca, 0x2f, 0xc9, 0x57, 0x2a, 0xe4, 0xe2, 0x0c,
